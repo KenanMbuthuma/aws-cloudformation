@@ -1,0 +1,28 @@
+# CDK
+cdk.out/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AWS SAM
+.aws-sam/
+
+# Terraform if added later
+.terraform/
+*.tfstate
+*.tfstate.*

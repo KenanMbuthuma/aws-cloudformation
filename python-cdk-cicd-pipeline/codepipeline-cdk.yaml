@@ -1,0 +1,461 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CodePipeline and CodeBuild pipeline for validating, synthesizing, and sequentially
+  deploying a Python AWS CDK application to Dev, Test, and Production accounts.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Pipeline and source
+        Parameters:
+          - PipelineName
+          - ConnectionArn
+          - RepositoryOwner
+          - RepositoryName
+          - RepositoryBranch
+      - Label:
+          default: CDK application
+        Parameters:
+          - CdkAppPath
+          - CdkStackNames
+          - EnvironmentContextKey
+          - CdkCliVersion
+          - BootstrapQualifier
+      - Label:
+          default: Target environments
+        Parameters:
+          - DevAccountId
+          - DevRegion
+          - TestAccountId
+          - TestRegion
+          - ProductionAccountId
+          - ProductionRegion
+    ParameterLabels:
+      ConnectionArn:
+        default: Existing GitHub CodeConnections ARN
+      CdkStackNames:
+        default: CDK stack selectors
+
+Parameters:
+  PipelineName:
+    Type: String
+    Default: python-cdk-multi-environment
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9.@_-]{0,99}$'
+    Description: Name of the CodePipeline pipeline.
+  ConnectionArn:
+    Type: String
+    AllowedPattern: '^arn:(aws|aws-cn|aws-us-gov):code(star-)?connections:[a-z0-9-]+:[0-9]{12}:connection/[A-Za-z0-9-]+$'
+    Description: ARN of an existing AVAILABLE AWS CodeConnections connection for GitHub.
+  RepositoryOwner:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+    Description: Case-sensitive GitHub organization or user name.
+  RepositoryName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_.-]+$'
+    Description: Case-sensitive GitHub repository name, without the owner.
+  RepositoryBranch:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+    Description: Branch that starts the pipeline when a commit is pushed.
+  CdkAppPath:
+    Type: String
+    Default: '.'
+    AllowedPattern: '^[A-Za-z0-9_./-]+$'
+    Description: Repository-relative directory containing cdk.json and requirements.txt.
+  CdkStackNames:
+    Type: String
+    Default: '--all'
+    AllowedPattern: '^[A-Za-z0-9*?._:/ -]+$'
+    Description: Space-separated CDK stack names/patterns, or --all.
+  EnvironmentContextKey:
+    Type: String
+    Default: environment
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9_-]*$'
+    Description: CDK context key receiving dev, test, or prod.
+  CdkCliVersion:
+    Type: String
+    Default: latest
+    AllowedPattern: '^(latest|[0-9]+\.[0-9]+\.[0-9]+)$'
+    Description: AWS CDK CLI npm version (pin a 2.x version for reproducible builds).
+  BootstrapQualifier:
+    Type: String
+    Default: hnb659fds
+    AllowedPattern: '^[a-z0-9]{9}$'
+    Description: Qualifier used when the target environments were bootstrapped.
+  DevAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: AWS account ID for Dev.
+  DevRegion:
+    Type: String
+    AllowedPattern: '^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$'
+    Description: AWS Region for Dev.
+  TestAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: AWS account ID for Test.
+  TestRegion:
+    Type: String
+    AllowedPattern: '^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$'
+    Description: AWS Region for Test.
+  ProductionAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: AWS account ID for Production.
+  ProductionRegion:
+    Type: String
+    AllowedPattern: '^[a-z]{2}(-gov)?-[a-z]+-[0-9]+$'
+    Description: AWS Region for Production.
+
+Resources:
+  # Pipeline artifacts remain in the pipeline account. CodeBuild, rather than a
+  # cross-account CodePipeline action, performs the target-account deployment.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      Tags:
+        - Key: Purpose
+          Value: CodePipelineArtifacts
+
+  # Deny unencrypted transport to the artifact bucket.
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # A fixed log group makes log permissions narrow and gives builds a useful
+  # retention period instead of retaining logs indefinitely.
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${PipelineName}-cdk'
+      RetentionInDays: 30
+
+  # CodeBuild can access pipeline artifacts and assume only the standard CDK
+  # bootstrap roles in the three explicitly configured target accounts.
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineArtifactsAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ArtifactBucketMetadata
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: ArtifactObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: BuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${CodeBuildLogGroup.Arn}:*'
+        - PolicyName: AssumeTargetCdkBootstrapRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AssumeDevBootstrapRoles
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:TagSession
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${DevAccountId}:role/cdk-${BootstrapQualifier}-deploy-role-${DevAccountId}-${DevRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${DevAccountId}:role/cdk-${BootstrapQualifier}-file-publishing-role-${DevAccountId}-${DevRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${DevAccountId}:role/cdk-${BootstrapQualifier}-image-publishing-role-${DevAccountId}-${DevRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${DevAccountId}:role/cdk-${BootstrapQualifier}-lookup-role-${DevAccountId}-${DevRegion}'
+              - Sid: AssumeTestBootstrapRoles
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:TagSession
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${TestAccountId}:role/cdk-${BootstrapQualifier}-deploy-role-${TestAccountId}-${TestRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${TestAccountId}:role/cdk-${BootstrapQualifier}-file-publishing-role-${TestAccountId}-${TestRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${TestAccountId}:role/cdk-${BootstrapQualifier}-image-publishing-role-${TestAccountId}-${TestRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${TestAccountId}:role/cdk-${BootstrapQualifier}-lookup-role-${TestAccountId}-${TestRegion}'
+              - Sid: AssumeProductionBootstrapRoles
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:TagSession
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${ProductionAccountId}:role/cdk-${BootstrapQualifier}-deploy-role-${ProductionAccountId}-${ProductionRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${ProductionAccountId}:role/cdk-${BootstrapQualifier}-file-publishing-role-${ProductionAccountId}-${ProductionRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${ProductionAccountId}:role/cdk-${BootstrapQualifier}-image-publishing-role-${ProductionAccountId}-${ProductionRegion}'
+                  - !Sub 'arn:${AWS::Partition}:iam::${ProductionAccountId}:role/cdk-${BootstrapQualifier}-lookup-role-${ProductionAccountId}-${ProductionRegion}'
+
+  # The same project is reused by Build/Synth and each deployment action. Action
+  # environment variables select validation or deployment mode and the target.
+  CdkCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${PipelineName}-cdk'
+      Description: Validates, synthesizes, and deploys the Python CDK application.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:8.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: BUILD_MODE
+            Value: validate
+          - Name: CDK_APP_PATH
+            Value: !Ref CdkAppPath
+          - Name: CDK_STACKS
+            Value: !Ref CdkStackNames
+          - Name: ENV_CONTEXT_KEY
+            Value: !Ref EnvironmentContextKey
+          - Name: CDK_CLI_VERSION
+            Value: !Ref CdkCliVersion
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+          StreamName: cdk
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 60
+      Tags:
+        - Key: Purpose
+          Value: PythonCdkPipeline
+
+  # CodePipeline may read/write only this pipeline's bucket, start only this
+  # build project, and use only the supplied GitHub connection.
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: UseGitHubConnection
+                Effect: Allow
+                # AWS recommends both permission names during the service's
+                # CodeStar Connections -> CodeConnections prefix transition.
+                Action:
+                  - codeconnections:UseConnection
+                  - codestar-connections:UseConnection
+                Resource: !Ref ConnectionArn
+              - Sid: ArtifactBucketMetadata
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: ArtifactObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: RunCdkBuild
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CdkCodeBuildProject.Arn
+
+  # Stages are separate (rather than parallel actions in one stage), guaranteeing
+  # Dev -> Test -> approval -> Production ordering.
+  CdkPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Ref PipelineName
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      RestartExecutionOnUpdate: false
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Sub '${RepositoryOwner}/${RepositoryName}'
+                BranchName: !Ref RepositoryBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: 'true'
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: BuildAndSynth
+          Actions:
+            - Name: ValidateAndSynth
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CdkCodeBuildProject
+                EnvironmentVariables: !Sub >-
+                  [{"name":"BUILD_MODE","value":"validate","type":"PLAINTEXT"},
+                  {"name":"DEPLOY_ENV","value":"dev","type":"PLAINTEXT"},
+                  {"name":"TARGET_ACCOUNT_ID","value":"${DevAccountId}","type":"PLAINTEXT"},
+                  {"name":"TARGET_REGION","value":"${DevRegion}","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: DeployDev
+          Actions:
+            - Name: DeployDev
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CdkCodeBuildProject
+                EnvironmentVariables: !Sub >-
+                  [{"name":"BUILD_MODE","value":"deploy","type":"PLAINTEXT"},
+                  {"name":"DEPLOY_ENV","value":"dev","type":"PLAINTEXT"},
+                  {"name":"TARGET_ACCOUNT_ID","value":"${DevAccountId}","type":"PLAINTEXT"},
+                  {"name":"TARGET_REGION","value":"${DevRegion}","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: DeployTest
+          Actions:
+            - Name: DeployTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CdkCodeBuildProject
+                EnvironmentVariables: !Sub >-
+                  [{"name":"BUILD_MODE","value":"deploy","type":"PLAINTEXT"},
+                  {"name":"DEPLOY_ENV","value":"test","type":"PLAINTEXT"},
+                  {"name":"TARGET_ACCOUNT_ID","value":"${TestAccountId}","type":"PLAINTEXT"},
+                  {"name":"TARGET_REGION","value":"${TestRegion}","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        - Name: ApproveProduction
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: Review the successful Dev and Test deployments before approving Production.
+              RunOrder: 1
+        - Name: DeployProduction
+          Actions:
+            - Name: DeployProduction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CdkCodeBuildProject
+                EnvironmentVariables: !Sub >-
+                  [{"name":"BUILD_MODE","value":"deploy","type":"PLAINTEXT"},
+                  {"name":"DEPLOY_ENV","value":"prod","type":"PLAINTEXT"},
+                  {"name":"TARGET_ACCOUNT_ID","value":"${ProductionAccountId}","type":"PLAINTEXT"},
+                  {"name":"TARGET_REGION","value":"${ProductionRegion}","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+Outputs:
+  PipelineName:
+    Description: CodePipeline pipeline name.
+    Value: !Ref CdkPipeline
+  PipelineArn:
+    Description: CodePipeline pipeline ARN.
+    Value: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CdkPipeline}'
+  ArtifactBucket:
+    Description: S3 bucket used for pipeline artifacts (retained when the stack is deleted).
+    Value: !Ref ArtifactBucket
+  CodeBuildProject:
+    Description: CodeBuild project used for validation, synthesis, and deployment.
+    Value: !Ref CdkCodeBuildProject
+  CodeConnectionsArn:
+    Description: Existing GitHub CodeConnections ARN used by the source action.
+    Value: !Ref ConnectionArn

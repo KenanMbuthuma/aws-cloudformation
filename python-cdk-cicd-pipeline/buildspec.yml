@@ -1,0 +1,84 @@
+version: 0.2
+
+# This buildspec serves two purposes. BUILD_MODE=validate runs CI and emits the
+# repository as BuildOutput. BUILD_MODE=deploy re-synthesizes for the selected
+# environment and deploys it with the modern CDK bootstrap roles.
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+      nodejs: 22
+    commands:
+      - echo "Installing AWS CDK CLI ${CDK_CLI_VERSION}"
+      - npm install --global "aws-cdk@${CDK_CLI_VERSION}"
+  pre_build:
+    commands:
+      - |
+        set -euo pipefail
+        if [[ "${CDK_APP_PATH}" = /* || "${CDK_APP_PATH}" =~ (^|/)\.\.(/|$) ]]; then
+          echo "CDK_APP_PATH must be a repository-relative path without '..': ${CDK_APP_PATH}" >&2
+          exit 2
+        fi
+        APP_DIR="$(realpath -m "${CODEBUILD_SRC_DIR}/${CDK_APP_PATH}")"
+        if [[ ! -d "${APP_DIR}" || ! -f "${APP_DIR}/cdk.json" ]]; then
+          echo "No cdk.json found in ${APP_DIR}. Set CdkAppPath to the CDK application directory." >&2
+          exit 2
+        fi
+        cd "${APP_DIR}"
+        python -m venv .venv
+        source .venv/bin/activate
+        python -m pip install --upgrade pip
+        if [[ -f requirements.txt ]]; then
+          python -m pip install -r requirements.txt
+        elif [[ -f pyproject.toml ]]; then
+          python -m pip install .
+        else
+          echo "Expected requirements.txt or pyproject.toml in ${APP_DIR}." >&2
+          exit 2
+        fi
+        python -m compileall -q .
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        APP_DIR="$(realpath -m "${CODEBUILD_SRC_DIR}/${CDK_APP_PATH}")"
+        cd "${APP_DIR}"
+        source .venv/bin/activate
+        export AWS_DEFAULT_REGION="${TARGET_REGION}"
+        export AWS_REGION="${TARGET_REGION}"
+        export CDK_DEFAULT_ACCOUNT="${TARGET_ACCOUNT_ID}"
+        export CDK_DEFAULT_REGION="${TARGET_REGION}"
+        read -r -a CDK_STACK_ARGS <<< "${CDK_STACKS}"
+        CONTEXT_ARGS=(-c "${ENV_CONTEXT_KEY}=${DEPLOY_ENV}" -c "target_account=${TARGET_ACCOUNT_ID}" -c "target_region=${TARGET_REGION}")
+
+        if [[ "${BUILD_MODE}" = "validate" ]]; then
+          if [[ -d tests ]] && find tests -type f -name 'test_*.py' -print -quit | grep -q .; then
+            echo "Running Python tests"
+            python -m pytest
+          else
+            echo "No tests/test_*.py files found; skipping tests"
+          fi
+          echo "Synthesizing CDK stacks for validation (${DEPLOY_ENV})"
+          cdk synth "${CDK_STACK_ARGS[@]}" "${CONTEXT_ARGS[@]}"
+        elif [[ "${BUILD_MODE}" = "deploy" ]]; then
+          echo "Synthesizing CDK stacks for ${DEPLOY_ENV} (${TARGET_ACCOUNT_ID}/${TARGET_REGION})"
+          cdk synth "${CDK_STACK_ARGS[@]}" "${CONTEXT_ARGS[@]}"
+          echo "Deploying CDK stacks to ${DEPLOY_ENV}"
+          cdk deploy "${CDK_STACK_ARGS[@]}" "${CONTEXT_ARGS[@]}" --require-approval never --concurrency 1
+        else
+          echo "Unsupported BUILD_MODE: ${BUILD_MODE}" >&2
+          exit 2
+        fi
+
+artifacts:
+  base-directory: .
+  files:
+    - '**/*'
+  exclude-paths:
+    - '**/.venv/**/*'
+    - '**/__pycache__/**/*'
+    - '**/.pytest_cache/**/*'
+    - '**/cdk.out/**/*'

@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PMA-account stack: cross-account IAM role that the hub account's Lambda
+  execution role can assume to call BatchGetInvoiceProfile in this account's
+  context. Deploy this template once per PMA account.
+
+Parameters:
+  HubAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: 12-digit AWS account ID of the hub account running the Lambda function.
+
+  HubLambdaRoleName:
+    Type: String
+    Default: InvoiceProfileLambdaExecutionRole
+    Description: >
+      Name of the Lambda execution role in the hub account (must match
+      LambdaRoleName in hub-account-invoice-lambda.yaml).
+
+  CrossAccountRoleName:
+    Type: String
+    Default: InvoiceProfileCrossAccountRole
+    Description: >
+      Name of the role created in this PMA account. Include this role's full
+      ARN in the hub template's PMARoleArns parameter.
+
+  ExternalId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional external ID for confused-deputy protection. If set, must match
+      the ExternalId parameter used by the hub-account Lambda template.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, '']]
+
+Resources:
+
+  CrossAccountInvoiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CrossAccountRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${HubAccountId}:role/${HubLambdaRoleName}'
+            Action: sts:AssumeRole
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  sts:ExternalId: !Ref ExternalId
+              - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: BatchGetInvoiceProfileAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowBatchGetInvoiceProfile
+                Effect: Allow
+                Action:
+                  - invoicing:BatchGetInvoiceProfile
+                  - invoicing:ListInvoiceSummaries
+                  - ce:GetCostAndUsage
+                Resource: '*'
+
+Outputs:
+  CrossAccountRoleArn:
+    Value: !GetAtt CrossAccountInvoiceRole.Arn
+    Description: >
+      Add this ARN to the PMARoleArns parameter of hub-account-invoice-lambda.yaml.

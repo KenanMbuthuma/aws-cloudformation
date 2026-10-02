@@ -1,0 +1,18 @@
+aws_region   = "af-south-1"
+project_name = "customer-portal"
+environment  = "prod"
+vpc_cidr     = "10.40.0.0/16"
+
+# false creates one NAT gateway per AZ for higher availability.
+availability_zone_count = 3
+single_nat_gateway       = false
+
+web_ingress_cidrs = ["0.0.0.0/0"]
+application_port  = 8080
+database_port     = 5432
+
+additional_tags = {
+  Owner      = "platform-team"
+  CostCenter = "replace-me"
+}
+

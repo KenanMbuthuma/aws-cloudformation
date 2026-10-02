@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Hub-account stack: Lambda function that assumes a cross-account role in one or
+  more PMA (Partner Managed Account) accounts, retrieves invoice profiles,
+  invoice summaries, and Cost Explorer usage data, and persists the responses
+  into DynamoDB.
+
+Parameters:
+  # Retained for backwards compatibility with the existing stack.
+  # The Lambda no longer uses PMA_ROLE_ARNS; role ARNs are derived from AccountIds.
+  PMARoleArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-delimited list of the cross-account role ARNs to assume in each PMA
+      account (created by the companion pma-account-invoice-role.yaml template).
+      Example: arn:aws:iam::111111111111:role/InvoiceProfileCrossAccountRole,arn:aws:iam::222222222222:role/InvoiceProfileCrossAccountRole
+
+  DynamoDBTableName:
+    Type: String
+    Default: InvoiceProfileResponses
+    Description: Name of the DynamoDB table that stores responses.
+
+  AccountIds:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-delimited list of AWS account IDs to pass as the AccountIds parameter
+      to BatchGetInvoiceProfile. Used as the default for every assumed-role call
+      unless a specific request in the Lambda event payload supplies its own
+      AccountIds override.
+      Example: 111111111111,222222222222
+
+  LambdaFunctionName:
+    Type: String
+    Default: InvoiceProfileFetcher
+
+  LambdaRoleName:
+    Type: String
+    Default: InvoiceProfileLambdaExecutionRole
+    Description: >
+      Fixed, predictable name for the Lambda execution role so it can be
+      referenced as the trusted principal in the PMA-account role's trust policy.
+
+  ExternalId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional external ID shared with the PMA account role's trust policy for
+      extra confused-deputy protection. Leave blank to omit.
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, '']]
+
+Resources:
+
+  InvoiceProfileTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AccountId
+          AttributeType: S
+        - AttributeName: RetrievedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountId
+          KeyType: HASH
+        - AttributeName: RetrievedAt
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AssumePMAInvoiceRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AssumeCrossAccountRole
+                Effect: Allow
+                Action: sts:AssumeRole
+
+                # OLD:
+                # Resource: !Ref PMARoleArns
+                #
+                # PMA_ROLE_ARNS is no longer consumed by the Lambda. Because the
+                # target ARNs are derived at runtime from ACCOUNT_IDS, IAM permits
+                # the standard InvoiceProfileCrossAccountRole name across accounts.
+                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/InvoiceProfileCrossAccountRole'
+
+        - PolicyName: WriteInvoiceProfileTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt InvoiceProfileTable.Arn
+
+  InvoiceProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          # OLD - retained here as a comment for rollback/reference:
+          # PMA_ROLE_ARNS: !Join [',', !Ref PMARoleArns]
+
+          TABLE_NAME: !Ref DynamoDBTableName
+          EXTERNAL_ID: !If [HasExternalId, !Ref ExternalId, '']
+          ACCOUNT_IDS: !Join [',', !Ref AccountIds]
+
+          # The role name is constant across the PMA accounts. Brandon's updated
+          # Lambda derives arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>.
+          ROLE_NAME: InvoiceProfileCrossAccountRole
+
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timedelta, timezone
+
+          import boto3
+
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          EXTERNAL_ID = os.environ.get("EXTERNAL_ID") or None
+          DEFAULT_ACCOUNT_IDS = [a for a in os.environ.get("ACCOUNT_IDS", "").split(",") if a]
+
+          ROLE_NAME = os.environ.get("ROLE_NAME", "InvoiceProfileCrossAccountRole")
+          ROLE_ARNS = [f"arn:aws:iam::{account_id}:role/{ROLE_NAME}" for account_id in DEFAULT_ACCOUNT_IDS]
+
+          _now = datetime.now(timezone.utc)
+          _current_month_start = _now.replace(day=1)
+          if _now.day == 1:
+              _previous_month_end = _current_month_start
+              _previous_month_start = (_current_month_start - timedelta(days=1)).replace(day=1)
+              _default_ce_start = _previous_month_start.strftime("%Y-%m-%d")
+              _default_ce_end = _previous_month_end.strftime("%Y-%m-%d")
+          else:
+              _default_ce_start = _current_month_start.strftime("%Y-%m-%d")
+              _default_ce_end = _now.strftime("%Y-%m-%d")
+
+          DEFAULT_CE_START = os.environ.get("CE_START") or _default_ce_start
+          DEFAULT_CE_END = os.environ.get("CE_END") or _default_ce_end
+          DEFAULT_CE_GRANULARITY = os.environ.get("CE_GRANULARITY", "MONTHLY")
+          DEFAULT_CE_METRICS = [
+              m for m in os.environ.get("CE_METRICS", "UnblendedCost").split(",") if m
+          ]
+
+          sts_client = boto3.client("sts")
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(TABLE_NAME)
+
+
+          def assume_role(role_arn):
+              """
+              Assume a cross-account role and return an invoicing client and a
+              Cost Explorer client backed by the same temporary credentials.
+              Cost Explorer is a global service - its endpoint is always us-east-1.
+              """
+              kwargs = {
+                  "RoleArn": role_arn,
+                  "RoleSessionName": "InvoiceProfileFetcher",
+              }
+              if EXTERNAL_ID:
+                  kwargs["ExternalId"] = EXTERNAL_ID
+              resp = sts_client.assume_role(**kwargs)
+              creds = resp["Credentials"]
+              shared = {
+                  "aws_access_key_id": creds["AccessKeyId"],
+                  "aws_secret_access_key": creds["SecretAccessKey"],
+                  "aws_session_token": creds["SessionToken"],
+              }
+              invoicing_client = boto3.client("invoicing", **shared)
+              ce_client = boto3.client("ce", region_name="us-east-1", **shared)
+              return invoicing_client, ce_client
+
+
+          def fetch_invoice_profiles(invoicing_client, account_ids):
+              """Call BatchGetInvoiceProfile and return the raw response."""
+              return invoicing_client.batch_get_invoice_profile(AccountIds=account_ids)
+
+
+          def fetch_invoice_summaries(invoicing_client, account_id, invoice_summaries_kwargs):
+              """
+              Call ListInvoiceSummaries for a single account, paginating through all pages.
+              Selector is required by the API and is always set to the target account ID
+              unless the caller explicitly overrides it (e.g. to select by InvoiceId).
+
+              The API requires either Filter.BillingPeriod or Filter.TimeInterval to be
+              present when querying by ACCOUNT_ID - both cannot be null. When the caller
+              supplies no Filter we default to the current calendar month via TimeInterval.
+
+              Note: without ReceiverRole, TimeInterval is limited to a one-month window.
+
+              Returns a combined dict with all InvoiceSummaries pages merged.
+              """
+              selector = invoice_summaries_kwargs.get(
+                  "Selector", {"ResourceType": "ACCOUNT_ID", "Value": account_id}
+              )
+
+              call_kwargs = {"Selector": selector}
+
+              if "Filter" in invoice_summaries_kwargs:
+                  # Caller supplied an explicit filter - use it as-is.
+                  call_kwargs["Filter"] = invoice_summaries_kwargs["Filter"]
+              else:
+                  # API requires BillingPeriod OR TimeInterval; default to current month.
+                  now = datetime.now(timezone.utc)
+                  start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                  if start.month == 12:
+                      end = start.replace(year=start.year + 1, month=1)
+                  else:
+                      end = start.replace(month=start.month + 1)
+
+                  call_kwargs["Filter"] = {
+                      "TimeInterval": {
+                          "StartDate": start.strftime("%Y-%m-%dT%H:%M:%S"),
+                          "EndDate": end.strftime("%Y-%m-%dT%H:%M:%S"),
+                      }
+                  }
+
+              if "MaxResults" in invoice_summaries_kwargs:
+                  call_kwargs["MaxResults"] = invoice_summaries_kwargs["MaxResults"]
+
+              all_summaries = []
+              while True:
+                  response = invoicing_client.list_invoice_summaries(**call_kwargs)
+                  all_summaries.extend(response.get("InvoiceSummaries", []))
+                  next_token = response.get("NextToken")
+                  if not next_token:
+                      break
+                  call_kwargs["NextToken"] = next_token
+
+              return {"InvoiceSummaries": all_summaries}
+
+
+          def fetch_cost_and_usage(ce_client, account_ids, ce_kwargs):
+              """
+              Call GetCostAndUsage, paginating through all pages.
+              Automatically filters to the specified account IDs via a LINKED_ACCOUNT
+              dimension filter, merged with any caller-supplied Filter using AND.
+              Returns a combined dict with all ResultsByTime pages merged.
+              """
+              account_filter = {
+                  "Dimensions": {
+                      "Key": "LINKED_ACCOUNT",
+                      "Values": account_ids,
+                  }
+              }
+
+              caller_filter = ce_kwargs.get("Filter")
+              merged_filter = {"And": [account_filter, caller_filter]} if caller_filter else account_filter
+
+              call_kwargs = {
+                  "TimePeriod": ce_kwargs.get(
+                      "TimePeriod",
+                      {"Start": DEFAULT_CE_START, "End": DEFAULT_CE_END},
+                  ),
+                  "Granularity": ce_kwargs.get("Granularity", DEFAULT_CE_GRANULARITY),
+                  "Metrics": ce_kwargs.get("Metrics", DEFAULT_CE_METRICS),
+                  "Filter": merged_filter,
+              }
+              if "GroupBy" in ce_kwargs:
+                  call_kwargs["GroupBy"] = ce_kwargs["GroupBy"]
+
+              all_results = []
+              last_response = {}
+              while True:
+                  last_response = ce_client.get_cost_and_usage(**call_kwargs)
+                  all_results.extend(last_response.get("ResultsByTime", []))
+                  next_token = last_response.get("NextPageToken")
+                  if not next_token:
+                      break
+                  call_kwargs["NextPageToken"] = next_token
+
+              return {
+                  "ResultsByTime": all_results,
+                  "GroupDefinitions": last_response.get("GroupDefinitions", []),
+              }
+
+
+          def store_result(account_id, data_type, response):
+              """Serialize and write a result item to DynamoDB."""
+              item = {
+                  "AccountId": account_id,
+                  "DataType": data_type,
+                  "RetrievedAt": datetime.now(timezone.utc).isoformat(),
+                  "RequestId": str(uuid.uuid4()),
+                  "Response": json.loads(json.dumps(response, default=str)),
+              }
+              table.put_item(Item=item)
+              return item
+
+
+          def handler(event, context):
+              # `event` is expected to optionally carry per-account request parameters:
+              # {
+              #   "requests": [
+              #     {
+              #       "role_arn": "arn:aws:iam::123456789012:role/InvoiceProfileCrossAccountRole",
+              #       "AccountIds": ["123456789012"],        # optional, overrides env var
+              #       "InvoiceSummaries": {                  # optional overrides
+              #         "Selector": {                        # defaults to ACCOUNT_ID selector
+              #           "ResourceType": "ACCOUNT_ID",
+              #           "Value": "123456789012"
+              #         },
+              #         "Filter": {                          # optional; if omitted, defaults to
+              #           "TimeInterval": {                  # current calendar month
+              #             "StartDate": "2025-01-01T00:00:00",
+              #             "EndDate": "2025-02-01T00:00:00"
+              #           }
+              #         },
+              #         "MaxResults": 100                    # optional, 1-100
+              #       },
+              #       "CostAndUsage": {                      # optional CE overrides
+              #         "TimePeriod": {"Start": "2025-07-01", "End": "2025-08-01"},
+              #         "Granularity": "DAILY",
+              #         "Metrics": ["UnblendedCost", "UsageQuantity"],
+              #         "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
+              #         "Filter": { ... }                    # merged with account filter
+              #       }
+              #     }
+              #   ]
+              # }
+              requests = event.get("requests") if isinstance(event, dict) else None
+              if not requests:
+                  requests = [{"role_arn": arn} for arn in ROLE_ARNS]
+
+              results = []
+              for req in requests:
+                  role_arn = req["role_arn"]
+                  account_id = role_arn.split(":")[4]
+
+                  invoicing_client, ce_client = assume_role(role_arn)
+
+                  invoice_account_ids = req.get("AccountIds") or [account_id]
+                  ce_account_ids = req.get("AccountIds") or [account_id]
+
+                  # --- BatchGetInvoiceProfile (scoped to this role's account) ---
+                  profile_response = fetch_invoice_profiles(invoicing_client, invoice_account_ids)
+                  results.append(store_result(account_id, "InvoiceProfile", profile_response))
+
+                  # --- ListInvoiceSummaries (scoped to this role's account) ---
+                  invoice_summaries_kwargs = req.get("InvoiceSummaries", {})
+                  summaries_response = fetch_invoice_summaries(
+                      invoicing_client, account_id, invoice_summaries_kwargs
+                  )
+                  results.append(store_result(account_id, "InvoiceSummaries", summaries_response))
+
+                  # --- GetCostAndUsage (can span multiple accounts if role allows) ---
+                  ce_kwargs = req.get("CostAndUsage", {})
+                  cost_response = fetch_cost_and_usage(ce_client, ce_account_ids, ce_kwargs)
+                  results.append(store_result(account_id, "CostAndUsage", cost_response))
+
+              return {
+                  "processed": len(requests),
+                  "accounts": list({r["AccountId"] for r in results}),
+                  "items_stored": len(results),
+              }
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt InvoiceProfileFunction.Arn
+
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Description: >
+      Use this ARN (or the fixed LambdaRoleName) as the trusted principal when
+      deploying pma-account-invoice-role.yaml in each PMA account.
+
+  DynamoDBTableName:
+    Value: !Ref InvoiceProfileTable

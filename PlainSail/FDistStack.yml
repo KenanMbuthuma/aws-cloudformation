@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Hub-account stack: Lambda function that assumes a cross-account role in one or
+  more PMA (Partner Managed Account) accounts, calls BatchGetInvoiceProfile in
+  that account's context, and persists the response into DynamoDB.
+
+Parameters:
+  PMARoleArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-delimited list of the cross-account role ARNs to assume in each PMA
+      account (created by the companion pma-account-invoice-role.yaml template).
+      Example: arn:aws:iam::111111111111:role/InvoiceProfileCrossAccountRole,arn:aws:iam::222222222222:role/InvoiceProfileCrossAccountRole
+
+  DynamoDBTableName:
+    Type: String
+    Default: InvoiceProfileResponses
+    Description: Name of the DynamoDB table that stores BatchGetInvoiceProfile responses.
+
+  AccountIds:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-delimited list of AWS account IDs to pass as the AccountIds parameter
+      to BatchGetInvoiceProfile. Used as the default for every assumed-role call
+      unless a specific request in the Lambda event payload supplies its own
+      AccountIds override.
+      Example: 111111111111,222222222222
+
+  LambdaFunctionName:
+    Type: String
+    Default: InvoiceProfileFetcher
+
+  LambdaRoleName:
+    Type: String
+    Default: InvoiceProfileLambdaExecutionRole
+    Description: >
+      Fixed, predictable name for the Lambda execution role so it can be
+      referenced as the trusted principal in the PMA-account role's trust policy.
+
+  ExternalId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional external ID shared with the PMA account role's trust policy for
+      extra confused-deputy protection. Leave blank to omit.
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, '']]
+
+Resources:
+
+  InvoiceProfileTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: AccountId
+          AttributeType: S
+        - AttributeName: RetrievedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountId
+          KeyType: HASH
+        - AttributeName: RetrievedAt
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AssumePMAInvoiceRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AssumeCrossAccountRole
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref PMARoleArns
+        - PolicyName: WriteInvoiceProfileTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt InvoiceProfileTable.Arn
+
+  InvoiceProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          PMA_ROLE_ARNS: !Join [',', !Ref PMARoleArns]
+          TABLE_NAME: !Ref DynamoDBTableName
+          EXTERNAL_ID: !If [HasExternalId, !Ref ExternalId, '']
+          ACCOUNT_IDS: !Join [',', !Ref AccountIds]
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import os
+          import uuid
+          from datetime import datetime, timezone
+
+          import boto3
+
+          TABLE_NAME = os.environ["TABLE_NAME"]
+          ROLE_ARNS = [a for a in os.environ.get("PMA_ROLE_ARNS", "").split(",") if a]
+          EXTERNAL_ID = os.environ.get("EXTERNAL_ID") or None
+          DEFAULT_ACCOUNT_IDS = [a for a in os.environ.get("ACCOUNT_IDS", "").split(",") if a]
+
+          sts_client = boto3.client("sts")
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(TABLE_NAME)
+
+
+          def assume_role(role_arn):
+              kwargs = {
+                  "RoleArn": role_arn,
+                  "RoleSessionName": "InvoiceProfileFetcher",
+              }
+              if EXTERNAL_ID:
+                  kwargs["ExternalId"] = EXTERNAL_ID
+              resp = sts_client.assume_role(**kwargs)
+              creds = resp["Credentials"]
+              return boto3.client(
+                  "invoicing",
+                  aws_access_key_id=creds["AccessKeyId"],
+                  aws_secret_access_key=creds["SecretAccessKey"],
+                  aws_session_token=creds["SessionToken"],
+              )
+
+
+          def handler(event, context):
+              # `event` is expected to optionally carry per-account request
+              # parameters, e.g. {"requests": [{"role_arn": "...", "Filter": {...}}]}
+              # Falls back to calling every configured role with no filter.
+              requests = event.get("requests") if isinstance(event, dict) else None
+              if not requests:
+                  requests = [{"role_arn": arn} for arn in ROLE_ARNS]
+
+              results = []
+              for req in requests:
+                  role_arn = req["role_arn"]
+                  account_id = role_arn.split(":")[4]
+                  client = assume_role(role_arn)
+
+                  call_kwargs = {k: v for k, v in req.items() if k != "role_arn"}
+                  call_kwargs.setdefault("AccountIds", DEFAULT_ACCOUNT_IDS)
+                  if not call_kwargs["AccountIds"]:
+                      raise ValueError(
+                          "AccountIds is required: set the AccountIds CloudFormation "
+                          "parameter (ACCOUNT_IDS env var) or supply 'AccountIds' in "
+                          "the request event for role_arn=%s" % role_arn
+                      )
+                  response = client.batch_get_invoice_profile(**call_kwargs)
+
+                  item = {
+                      "AccountId": account_id,
+                      "RetrievedAt": datetime.now(timezone.utc).isoformat(),
+                      "RequestId": str(uuid.uuid4()),
+                      "Response": json.loads(json.dumps(response, default=str)),
+                  }
+                  table.put_item(Item=item)
+                  results.append(item)
+
+              return {"processed": len(results), "accounts": [r["AccountId"] for r in results]}
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt InvoiceProfileFunction.Arn
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Description: >
+      Use this ARN (or the fixed LambdaRoleName) as the trusted principal when
+      deploying pma-account-invoice-role.yaml in each PMA account.
+  DynamoDBTableName:
+    Value: !Ref InvoiceProfileTable

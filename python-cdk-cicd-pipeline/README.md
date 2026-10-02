@@ -6,6 +6,8 @@ Python AWS CDK application. It implements this fixed promotion path:
 ```text
 GitHub -> Validate/Build/Synth -> Deploy Dev -> Deploy Test
        -> Manual approval -> Deploy Production
+                              \
+                               -> SNS approval/failure notifications
 ```
 
 ## Repository inspection result
@@ -28,7 +30,10 @@ itself is not modified.
 - Dev, Test, and Production actions each start a clean CodeBuild run, install
   dependencies, synthesize with the target context, and run `cdk deploy`.
 - Separate pipeline stages make deployments sequential. A CodePipeline manual
-  approval action gates Production.
+  approval action gates Production and publishes the approval request to SNS.
+- An EventBridge rule sends failed pipeline executions to a dedicated SNS topic.
+  This covers failed Dev, Test, and Production deployments as well as source or
+  validation failures.
 - An encrypted, versioned, private S3 bucket stores artifacts and is retained if
   the pipeline stack is deleted, protecting build evidence from accidental loss.
 
@@ -51,6 +56,8 @@ CodePipeline artifact bucket.
    repository.
 6. The CDK app accepts context such as `-c environment=dev` and uses the passed
    account/Region (see **Application integration** below).
+7. If `NotificationEmail` is supplied, its recipient confirms the SNS
+   subscription email. Unconfirmed subscriptions do not receive notifications.
 
 ## Required parameters
 
@@ -66,6 +73,7 @@ CodePipeline artifact bucket.
 | `EnvironmentContextKey` | Context key receiving `dev`, `test`, or `prod`; defaults to `environment` |
 | `BootstrapQualifier` | Bootstrap qualifier; defaults to `hnb659fds` |
 | `CdkCliVersion` | `latest` by default; pin an exact CDK 2.x version for reproducibility |
+| `NotificationEmail` | Optional email recipient for approval and failure notifications |
 
 `PipelineName` is optional and defaults to `python-cdk-multi-environment`.
 
@@ -127,6 +135,7 @@ aws cloudformation deploy \
     RepositoryOwner=GITHUB_OWNER \
     RepositoryName=GITHUB_REPOSITORY \
     RepositoryBranch=main \
+    NotificationEmail=platform-alerts@example.com \
     CdkAppPath=path/to/cdk-app \
     CdkStackNames=MyApplicationStack \
     DevAccountId=111111111111 DevRegion=af-south-1 \
@@ -142,7 +151,9 @@ shell. Using `CdkStackNames=--all` avoids shell-specific handling.
 The Build/Synth stage validates against the Dev account and context. This lets
 CDK context lookups run before promotion. Dev deploys first; only success starts
 Test. After Test succeeds, the execution waits for approval in the CodePipeline
-console (or API). Approval starts Production; rejection or expiry stops it.
+console (or API). The approval request is also published to the notification SNS
+topic. Approval starts Production; rejection or expiry stops it. Production can
+therefore never run without an explicit approval for that pipeline execution.
 
 Each environment receives these values:
 
@@ -156,6 +167,21 @@ CDK_DEFAULT_REGION=<configured Region>
 
 The source revision is packaged once by Build/Synth and that exact `BuildOutput`
 artifact is used by all three deployment actions.
+
+## Notifications and operational response
+
+The `NotificationTopicArn` output identifies the SNS topic used by the pipeline.
+When `NotificationEmail` is non-empty, CloudFormation creates an email
+subscription that remains `PendingConfirmation` until the recipient accepts it.
+Production approval requests and pipeline execution failures are then delivered
+to that address.
+
+An EventBridge rule matches `FAILED` CodePipeline execution state changes for
+this pipeline only. Its message includes the pipeline name, execution ID,
+account, Region, and failure time. Use the execution ID to inspect the failed
+action and its CodeBuild log stream. The SNS topic can also be subscribed to AWS
+Chatbot, HTTPS incident-management endpoints, Lambda, or SQS according to the
+organization's operations model.
 
 ## Application integration
 
@@ -198,3 +224,5 @@ for least privilege. If the CDK app builds Docker image assets, set
   CDK stacks create.
 - Confirmation that the app consumes the supplied context names, or matching
   customization of `buildspec.yml` / `EnvironmentContextKey`.
+- An optional notification email or an external subscriber attached to the
+  `NotificationTopicArn` output; email subscriptions must be confirmed.

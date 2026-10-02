@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploy this template in EACH PMA account.
+  Creates the cross-account IAM role that Account 147's Lambda will assume
+  to call invoicing:BatchGetInvoiceProfile.
+
+Parameters:
+
+  ManagementAccountId:
+    Type: String
+    Default: '147'
+    Description: AWS Account ID of the central management account (Account 147).
+
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: >
+      ARN of the Lambda execution role from Account 147. Found in the
+      invoice-profile-aggregator stack outputs as LambdaExecutionRoleArn.
+      Example: arn:aws:iam::147:role/invoice-profile-aggregator-lambda-execution-role
+
+  CrossAccountRoleName:
+    Type: String
+    Default: InvoiceProfileCrossAccountRole
+    Description: >
+      Must match the CrossAccountRoleName parameter used in the
+      invoice-profile-aggregator stack in Account 147.
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+
+  InvoiceProfileCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CrossAccountRoleName
+      Description: >
+        Allows Account 147's Lambda to assume this role and call
+        invoicing:BatchGetInvoiceProfile in this PMA account.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccount147Lambda
+            Effect: Allow
+            Principal:
+              AWS: !Ref LambdaExecutionRoleArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Sub 'invoice-aggregator-${ManagementAccountId}'
+      Policies:
+        - PolicyName: InvoiceProfileReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowBatchGetInvoiceProfile
+                Effect: Allow
+                Action: 
+                  - invoicing:BatchGetInvoiceProfile
+                  - invoicing:ListInvoiceSummaries
+                  - ce:GetCostAndUsage
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: invoice-profile-aggregation
+        - Key: ManagedBy
+          Value: !Sub 'Account-${ManagementAccountId}'
+
+Outputs:
+
+  CrossAccountRoleArn:
+    Description: ARN of the cross-account role created in this PMA
+    Value: !GetAtt InvoiceProfileCrossAccountRole.Arn
+
+  CrossAccountRoleName:
+    Description: Name of the cross-account role
+    Value: !Ref InvoiceProfileCrossAccountRole

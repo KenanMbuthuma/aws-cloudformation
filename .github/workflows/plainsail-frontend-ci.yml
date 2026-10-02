@@ -1,0 +1,45 @@
+name: Plainsail frontend CI
+
+on:
+  push:
+    paths:
+      - "PlainSail/plainsail-platform/frontend/**"
+      - ".github/workflows/plainsail-frontend-ci.yml"
+  pull_request:
+    paths:
+      - "PlainSail/plainsail-platform/frontend/**"
+      - ".github/workflows/plainsail-frontend-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plainsail-frontend-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Format, lint, test, build and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: PlainSail/plainsail-platform/frontend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: PlainSail/plainsail-platform/frontend/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Run frontend quality gate
+        run: npm run check
